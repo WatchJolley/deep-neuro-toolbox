@@ -1,0 +1,687 @@
+--- ./gpu_implementation/gym_tensorflow/Makefile	
++++ ./gpu_implementation/gym_tensorflow/Makefile	
+@@ -1,8 +1,10 @@
+-USE_SDL := 0
+-USE_ALE := 0
+-USE_GPU := 1
++USE_SDL   := 0
++USE_ALE   := 1
++USE_GPU   := 1
++USE_MAZE  := 1
++USE_RIVER := 1
+ 
+-DIR := ./
++DIR := $(shell pwd)
+ 
+ TF_INC := $(shell python -c 'import tensorflow as tf; print(tf.sysconfig.get_include())')
+ TF_LIB := $(shell python -c 'import tensorflow as tf; print(tf.sysconfig.get_lib())')
+@@ -24,13 +26,24 @@
+     SOURCES += $(DIR)/atari/*.cpp
+ endif
+ 
++ifeq ($(USE_MAZE), 1)
++    FLAGS += -I$(DIR) -I$(DIR)/maze
++    SOURCES += $(DIR)/maze/*.cpp
++endif
++
++ifeq ($(USE_RIVER), 1)
++    RC      := $(shell pwd)/rivercrossing
++    FLAGS   += -I$(RC)
++    SOURCES += $(RC)/*.cpp
++    SOURCES += $(RC)/tools/*.cpp
++    SOURCES += $(RC)/rivercrossing/*.cpp
++endif
++
++
+ UNAME_S := $(shell uname -s)
+ ifeq ($(UNAME_S),Linux)
+-    ifeq ($(USE_ALE),1)
+-        FLAGS+= -Wl -rpath=$(ALE)/build
+-    endif
++    FLAGS += -Wl,-rpath=$(ALE)/build
+ endif
+-
+ ifeq ($(UNAME_S),Darwin)
+     FLAGS += -framework Cocoa
+ endif
+--- ./gpu_implementation/gym_tensorflow/__init__.py	
++++ ./gpu_implementation/gym_tensorflow/__init__.py	
+@@ -1,10 +1,12 @@
+ import tensorflow as tf
+ import numpy as np
+ from .tf_env import GymEnv
+-from.import atari, maze
++from.import atari, maze, rivercrossing
+ from .wrappers import StackFramesWrapper
+ 
+ def make(game, batch_size, *args, **kwargs):
++    if game.startswith('rivercrossing.'):
++        return rivercrossing.RivercrossingEnv(game[14:],batch_size)
+     if game == 'maze':
+         return maze.MazeEnv(batch_size)
+     if game in atari.games:
+@@ -19,15 +21,16 @@
+     assert env.discrete_action
+     actions = tf.random_uniform((1,), minval=0, maxval=env.action_space, dtype=tf.int32)
+ 
+-    reset_op = env.reset()
+-    obs_op = env.observation()
+-    rew_op, done_op=env.step(actions)
++    reset_op        = env.reset()
++    obs_op          = env.observation()
++    rew_op, done_op = env.step(actions)
+ 
+     sess.run(tf.global_variables_initializer())
+ 
+     sess.run(reset_op)
+ 
+     ref_batch = []
++
+     while len(ref_batch) < batch_size:
+         obs, done = sess.run([obs_op, done_op])
+         ref_batch.append(obs)
+--- ./gpu_implementation/gym_tensorflow/maze/tf_maze.py	
++++ ./gpu_implementation/gym_tensorflow/maze/tf_maze.py	
+@@ -18,6 +18,7 @@
+ """
+ import tensorflow as tf
+ from gym_tensorflow.tf_env import TensorFlowEnv, gym_tensorflow_module
++import numpy as np
+ 
+ 
+ class MazeEnv(TensorFlowEnv):
+@@ -37,16 +38,21 @@
+ 
+     @property
+     def discrete_action(self):
+-        return False
++        return True
+ 
+     def step(self, action, indices=None, name=None):
++        if indices is None:
++            indices = np.arange(self.batch_size)
+         with tf.variable_scope(name, default_name='MazeStep'):
+-            #action = tf.Print(action, [action], 'action=')
++            # action = tf.Print(action, [action], 'action=')
+             return gym_tensorflow_module.environment_step(self.instances, indices=indices, action=action)
+ 
+     def reset(self, indices=None, max_frames=None, name=None):
+-        '''Resets Atari instances with a random noop start (1-30) and set the maximum number of frames for the episode (default 100,000 * frameskip)
++        '''Resets Atari (Maze?) instances with a random noop start (1-30) and set the maximum number of frames for the episode (default 100,000 * frameskip)
+         '''
++        if indices is None:
++            indices = np.arange(self.batch_size)
++
+         with tf.variable_scope(name, default_name='MazeReset'):
+             noops = tf.random_uniform(tf.shape(indices), minval=1, maxval=31, dtype=tf.int32)
+             if max_frames is None:
+@@ -54,6 +60,9 @@
+             return gym_tensorflow_module.environment_reset(self.instances, indices, noops=noops, max_frames=max_frames)
+ 
+     def observation(self, indices=None, name=None):
++        if indices is None:
++            indices = np.arange(self.batch_size)
++
+         with tf.variable_scope(name, default_name='MazeObservation'):
+             with tf.device('/cpu:0'):
+                 obs = gym_tensorflow_module.environment_observation(self.instances, indices, T=tf.float32)
+--- ./gpu_implementation/gym_tensorflow/tf_env.py	
++++ ./gpu_implementation/gym_tensorflow/tf_env.py	
+@@ -30,24 +30,16 @@
+ 
+ class PythonEnv(TensorFlowEnv):
+     def step(self, action, indices=None, name=None):
+-
+-        if indices is None:
+-            indices = np.arange(self.batch_size)
+         with tf.variable_scope(name, default_name='PythonStep'):
+-
+-            with tf.device('/cpu:0'):
+-                reward, done = tf.py_func(self._step, [action, indices], [tf.float32, tf.bool])
+-                reward.set_shape(indices.shape)
+-                done.set_shape(indices.shape)
+-                return reward, done
++            reward, done = tf.py_func(self._step, [action, indices], [tf.float32, tf.bool])
++            reward.set_shape(indices.get_shape())
++            done.set_shape(indices.get_shape())
++            return reward, done
+ 
+     def _reset(self, indices):
+         raise NotImplementedError()
+ 
+     def reset(self, indices=None, max_frames=None, name=None):
+-        
+-        if indices is None:
+-            indices = np.arange(self.batch_size)
+         with tf.variable_scope(name, default_name='PythonReset'):
+             return tf.py_func(self._reset, [indices], tf.int64).op
+ 
+@@ -58,14 +50,9 @@
+         raise NotImplementedError()
+ 
+     def observation(self, indices=None, name=None):
+-
+-        if indices is None:
+-            indices = np.arange(self.batch_size)
+         with tf.variable_scope(name, default_name='PythonObservation'):
+-
+-            with tf.device('/cpu:0'):
+-                obs = tf.py_func(self._obs, [indices], tf.float32)
+-                obs.set_shape(tuple(indices.shape) + self.observation_space)
++            obs = tf.py_func(self._obs, [indices], tf.float32)
++            obs.set_shape(tuple(indices.get_shape()) + self.observation_space)
+             return tf.expand_dims(obs, axis=1)
+ 
+     def final_state(self, indices, name=None):
+@@ -85,13 +72,10 @@
+         import gym
+         self.env = [gym.make(name) for _ in range(batch_size)]
+         self.obs = [None] * batch_size
+-        self.is_discrete_action = isinstance( self.env[0].action_space , gym.spaces.Discrete ) 
+-        self.batch_size = batch_size
+ 
+     @property
+     def action_space(self):
+-        #return np.prod(self.env[0].action_space.shape, dtype=np.int32)
+-        return self.env[0].action_space.n
++        return np.prod(self.env[0].action_space.shape)
+ 
+     @property
+     def observation_space(self):
+@@ -99,14 +83,10 @@
+ 
+     @property
+     def discrete_action(self):
+-        return self.is_discrete_action
+-
+-    @property
+-    def env_default_timestep_cutoff(self):
+-        return 1000
++        return False
+ 
+     def _step(self, action, indices):
+-        assert self.discrete_action == True 
++        assert self.discrete_action == False
+         results = map(lambda i: self.env[indices[i]].step(action[i]), range(len(indices)))
+         obs, reward, done, _ = zip(*results)
+         for i in range(len(indices)):
+--- ./gpu_implementation/neuroevolution/models/__init__.py	
++++ ./gpu_implementation/neuroevolution/models/__init__.py	
+@@ -1,4 +1,4 @@
+ from .dqn_xavier import SmallDQN, LargeDQN
+-from .dqn import Model, LargeModel
++from .dqn import *
+ from .batchnorm import ModelBN, ModelVirtualBN
+ from .simple import LinearClassifier, SimpleClassifier
+--- ./gpu_implementation/neuroevolution/models/base.py	
++++ ./gpu_implementation/neuroevolution/models/base.py	
+@@ -23,6 +23,10 @@
+ import tabular_logger as tlogger
+ from gym_tensorflow.ops import indexed_matmul
+ 
++from tensorflow.python.ops import array_ops
++from tensorflow.python.ops import math_ops
++from tensorflow.python.ops import random_ops
++
+ class BaseModel(object):
+     def __init__(self):
+         self.nonlin = tf.nn.relu
+@@ -51,26 +55,318 @@
+     def create_bias_variable(self, name, shape):
+         return self.create_variable(name, shape, 0.0)
+ 
++    def recurrentTraining(self, x, kernel_size, name, std=1.0):
++        assert len(x.get_shape()) == 5 # Policies x Batch x Height x Width x Feature
++        num_outputs = x.get_shape()[4]
++        sum = kernel_size * kernel_size * int(x.get_shape()[-1].value)
++
++        with tf.variable_scope(name):
++            w = self.create_weight_variable('w', std=std, shape=( kernel_size, kernel_size, int(x.get_shape()[-1].value),  num_outputs ))
++
++            self.description += "Training recurrent layer {} with input shape {} and output shape {}\n".format(
++                    name,
++                    x.get_shape(),
++                    x.get_shape()
++                )
++
++            return x
++
++    def recurrentEvo(self, x, kernel_size, name, dropout=True, dropoutRate=0.1, std=1.0):
++        assert len(x.get_shape()) == 5 # Policies x Batch x Height x Width x Feature
++        num_outputs = x.get_shape()[4]
++        tensor_size = x.get_shape()[2].value
++        stride=1
++        padding="SAME"
++        sum = kernel_size * kernel_size * int(x.get_shape()[-1].value)
++
++
++        with tf.variable_scope(name):
++            # boolean gate is True/False for recurrancy // controlled by evolution
++            boolgate = self.create_weight_variable('boolgate', std=0.5, shape=(1, num_outputs))
++            l = [i for i in boolgate.get_shape().as_list() if i is not None]
++            y = tf.constant(float(tensor_size), shape=l)
++            boolgate = tf.round(tf.abs(tf.multiply(boolgate, y)))
++            ret = x
++            w = self.create_weight_variable('w', std=std, shape=( kernel_size, kernel_size, int(x.get_shape()[-1].value),  num_outputs ))
++
++            # dropout drops recurrent connections
++            if (dropout == True):
++                noise_shape = array_ops.shape(boolgate)
++                # uniform [keep_prob, 1.0 + keep_prob)
++                random_tensor = 1.0 - dropoutRate
++                random_tensor += random_ops.random_uniform(noise_shape)
++                # 0. if [keep_prob, 1.0) and 1. if [1.0, 1.0 + keep_prob)
++                binary_tensor = math_ops.floor(random_tensor)
++                boolgate = tf.multiply(boolgate, binary_tensor)
++
++            for i in range(tensor_size):
++                minimum = i
++
++                bool = tf.clip_by_value(boolgate, minimum, tensor_size)
++                y = tf.constant(float(minimum), shape=l)
++                bool = tf.subtract(bool, y, name=None)
++                bool = tf.clip_by_value(bool, 0, 1)
++
++                w = tf.reshape(w, [-1, sum, num_outputs])
++                bool = tf.reshape( bool, [-1,1,num_outputs])
++                bool = tf.ones([1, sum, 1]) * bool
++
++                string = 'boolgate'
++                string += repr(i)
++
++                # bool = tf.Print(bool, [bool], summarize=120000, message=string)
++                # bool = tf.Print(bool, [tf.shape(bool)], summarize=1200, message="boolgate ")
++                # w = tf.Print(w, [w], summarize=120000, message="Before ")
++                w = tf.multiply(bool, w)
++
++                x_reshape = tf.reshape( ret, ( -1,  x.get_shape()[2], x.get_shape()[3], x.get_shape()[4] ) )
++                patches = tf.extract_image_patches( x_reshape, [1, kernel_size, kernel_size, 1],  [1, stride, stride, 1],  rates=[1, 1, 1, 1],  padding=padding )
++                # Creates final tensor shape
++                final_shape = ( tf.shape(x)[0], tf.shape(x)[1], patches.get_shape()[1].value, patches.get_shape()[2].value, num_outputs )
++                patches = tf.reshape(patches, [ tf.shape(x)[0], -1, kernel_size * kernel_size * x.get_shape()[-1].value ])
++
++                # patches = tf.Print(patches, [tf.shape(patches)], summarize=40000, message="patches : ")
++                # w = tf.Print(w, [tf.shape(w)], summarize=40000, message="w : ")
++                if self.indices is None:
++                    ret = tf.matmul(patches, w)
++                else:
++                    ret = indexed_matmul(patches, w, self.indices)
++                # ret = tf.Print(ret, [tf.shape(ret)], summarize=40000, message="ret : ")
++                ret = tf.reshape(ret, final_shape)
++                x_reshape = tf.reshape(x_reshape, final_shape)
++                ret = tf.add(ret, x_reshape)
++
++            self.description += "Recurrent layer {} with input shape {} and output shape {}\n".format(
++                    name,
++                    x.get_shape(),
++                    ret.get_shape()
++                )
++
++            return ret
++
++    def recurrent(self, x, kernel_size, name, iterations=1, std=1.0, relu=False, iotas=False):
++        assert len(x.get_shape()) == 5 # Policies x Batch x Height x Width x Feature 
++        num_outputs = x.get_shape()[4]
++        tensor_size = x.get_shape()[2].value
++        stride=1
++        padding="SAME"
++        flatten_tensor_size = (tensor_size * tensor_size) 
++        tensor_input = x
++
++        with tf.variable_scope(name):
++            if iotas == True:
++                input_shape = [i for i in x.get_shape().as_list() if i is not None]
++                multiplier = self.create_weight_variable('multiplier', std=1.0, shape=(1, num_outputs))
++                multiplier = tf.ones([1, flatten_tensor_size, 1]) * multiplier
++                multiplier = tf.slice(multiplier, [0,0,0], [tf.shape(x)[0],flatten_tensor_size,num_outputs])
++                x_reshape = tf.reshape(x, shape=(tf.shape(x)[0],-1,num_outputs))
++
++                tensor_input = tf.multiply(multiplier, x_reshape)
++
++
++            w = self.create_weight_variable('w', 
++                                            std=std,
++                                            shape=(
++                                                kernel_size,
++                                                kernel_size,
++                                                int(x.get_shape()[-1].value),
++                                                num_outputs
++                                            )
++                                        )
++            # For Testing
++            # w = tf.constant(
++            #                 0.01,
++            #                 shape=(
++            #                     kernel_size, 
++            #                     kernel_size, 
++            #                     int(x.get_shape()[-1].value), 
++            #                     num_outputs)
++            #             )
++
++            w = tf.reshape(
++                            w, #Tensor
++                            [   -1, 
++                                kernel_size * kernel_size * int(x.get_shape()[-1].value),
++                                num_outputs
++                            ] #Shape
++                        )
++            # w = tf.Print(w, [tf.shape(w)], summarize=120000, message='W Shape: ')
++
++
++            x_reshape = tf.reshape(
++                                    x, #Tensor
++                                    (
++                                        -1, 
++                                        x.get_shape()[2], 
++                                        x.get_shape()[3], 
++                                        x.get_shape()[4]
++                                    )  #Shape
++                                )
++
++            patches = tf.extract_image_patches(
++                                                x_reshape, #images
++                                                [1, kernel_size, kernel_size, 1], #ksizes
++                                                [1, stride, stride, 1], #strides
++                                                rates=[1, 1, 1, 1],  #rates
++                                                padding=padding #padding
++                                            )
++
++            # Creates final tensor shape
++            final_shape = (
++                            tf.shape(x)[0],               #Batches
++                            tf.shape(x)[1], 
++                            patches.get_shape()[1].value, #Patches Width
++                            patches.get_shape()[2].value, #Patches Height
++                            num_outputs                   #Features
++                        )
++
++            patches = tf.reshape(
++                                    patches, #Tensor
++                                    [
++                                        tf.shape(x)[0],
++                                        -1,
++                                         kernel_size * kernel_size * x.get_shape()[-1].value
++                                    ] #Shape
++                                )
++
++            # patches = tf.Print(patches, [tf.shape(patches)], summarize=120000, message='patches Shape: ')
++            # x_reshape = tf.Print(x_reshape, [tf.shape(x_reshape)], summarize=120000, message='x_reshape Shape: ')
++            # w = tf.Print(w, [tf.shape(w)], summarize=120000, message='W Shape: ')
++
++            if self.indices is None:
++                ret = tf.matmul(patches, w)
++            else:
++                ret = indexed_matmul(patches, w, self.indices)
++            # ret = tf.Print(ret, [tf.shape(ret)], summarize=120000, message='ret Shape: ')
++            ret = tf.reshape(ret, final_shape)
++            if iotas == True:
++                x_reshape = tf.reshape(tensor_input, final_shape)
++            else:
++                x_reshape = tf.reshape(x_reshape, final_shape)
++
++            ret = tf.add(ret, x_reshape)
++            if relu == True:
++                ret = tf.nn.relu(ret)
++
++            for i in range(iterations-1):
++                ret_reshape = tf.reshape(
++                                        ret, #Tensor
++                                        (
++                                            -1, 
++                                            x.get_shape()[2], 
++                                            x.get_shape()[3], 
++                                            x.get_shape()[4]
++                                        )  #Shape
++                                    )
++
++
++                patches = tf.extract_image_patches(
++                                                    ret_reshape, #images
++                                                    [1, kernel_size, kernel_size, 1], #ksizes
++                                                    [1, stride, stride, 1], #strides
++                                                    rates=[1, 1, 1, 1],  #rates
++                                                    padding=padding #padding
++                                                )
++
++                patches = tf.reshape(
++                                        patches, #Tensor
++                                        [
++                                            tf.shape(x)[0],
++                                            -1,
++                                             kernel_size * kernel_size * x.get_shape()[-1].value
++                                        ] #Shape
++                                    )
++
++                if self.indices is None:
++                    ret = tf.matmul(patches, w)
++                else:
++                    ret = indexed_matmul(patches, w, self.indices)
++                ret = tf.reshape(ret, final_shape)
++                if iotas == True:
++                    ret_reshape = tf.reshape(tensor_input, final_shape)
++                else:
++                    ret_reshape = tf.reshape(ret_reshape, final_shape)
++                ret = tf.add(ret, ret_reshape)
++
++                if relu == True:
++                    ret = tf.nn.relu(ret)
++                # ret = tf.Print(ret, [ret], summarize=40000, message="Final : ")
++
++
++            self.description += "Recurrent layer {} with input shape {} and output shape {}\n".format(
++                    name,
++                    x.get_shape(),
++                    ret.get_shape()
++                )
++            return ret
++
+     def conv(self, x, kernel_size, num_outputs, name, stride=1, padding="SAME", bias=True, std=1.0):
++        print(len(x.get_shape()))
++        print(x.get_shape())
+         assert len(x.get_shape()) == 5 # Policies x Batch x Height x Width x Feature
+         with tf.variable_scope(name):
+-            w = self.create_weight_variable('w', std=std,
+-                                            shape=(kernel_size, kernel_size, int(x.get_shape()[-1].value), num_outputs))
+-            w = tf.reshape(w, [-1, kernel_size *kernel_size * int(x.get_shape()[-1].value), num_outputs])
+-
+-            x_reshape = tf.reshape(x, (-1, x.get_shape()[2], x.get_shape()[3], x.get_shape()[4]))
+-            patches = tf.extract_image_patches(x_reshape, [1, kernel_size, kernel_size, 1], [1, stride, stride, 1], rates=[1, 1, 1, 1], padding=padding)
+-            final_shape = (tf.shape(x)[0], tf.shape(x)[1], patches.get_shape()[1].value, patches.get_shape()[2].value, num_outputs)
+-            patches = tf.reshape(patches, [tf.shape(x)[0],
+-                                           -1,
+-                                           kernel_size * kernel_size * x.get_shape()[-1].value])
++            w = self.create_weight_variable('w', 
++                                            std=std,
++                                            shape=(kernel_size, kernel_size, int(x.get_shape()[-1].value), num_outputs)
++                                        )
++
++            w = tf.reshape(
++                            w, #Tensor
++                            [   -1, 
++                                kernel_size *kernel_size * int(x.get_shape()[-1].value),
++                                num_outputs
++                            ] #Shape
++                        )
++
++            x_reshape = tf.reshape(
++                                    x, #Tensor
++                                    (
++                                        -1, 
++                                        x.get_shape()[2], 
++                                        x.get_shape()[3], 
++                                        x.get_shape()[4]
++                                    )  #Shape
++                                )
++
++            patches = tf.extract_image_patches(
++                                                x_reshape, #images
++                                                [1, kernel_size, kernel_size, 1], #ksizes
++                                                [1, stride, stride, 1], #strides
++                                                rates=[1, 1, 1, 1],  #rates
++                                                padding=padding #padding
++                                            )
++
++            # Creates final tensor shape
++            final_shape = (
++                            tf.shape(x)[0], 
++                            tf.shape(x)[1], 
++                            patches.get_shape()[1].value, 
++                            patches.get_shape()[2].value, 
++                            num_outputs
++                        )
++
++
++            patches = tf.reshape(
++                                    patches, #Tensor
++                                    [
++                                        tf.shape(x)[0],
++                                        -1,
++                                         kernel_size * kernel_size * x.get_shape()[-1].value
++                                    ] #Shape
++                                )
+ 
+             if self.indices is None:
+                 ret = tf.matmul(patches, w)
+             else:
+                 ret = indexed_matmul(patches, w, self.indices)
+             ret = tf.reshape(ret, final_shape)
+-            self.description += "Convolution layer {} with input shape {} and output shape {}\n".format(name, x.get_shape(), ret.get_shape())
++            # print(ret)
++
++            self.description += "Convolution layer {} with input shape {} and output shape {}\n".format(
++                    name,
++                    x.get_shape(),
++                    ret.get_shape()
++                )
+ 
+ 
+             if bias:
+@@ -78,17 +374,21 @@
+                 if self.indices is not None:
+                     b = tf.gather(b, self.indices)
+ 
++                # b = tf.Print(b, [b], summarize=120000, message="B : ")
+                 ret =  ret + b
+             return ret
+ 
+     def dense(self, x, size, name, bias=True, std=1.0):
+         with tf.variable_scope(name):
+             w = self.create_weight_variable('w', std=std, shape=(x.get_shape()[-1].value, size))
++
+             if self.indices is None:
+                 ret = tf.matmul(x, w)
+             else:
+                 ret = indexed_matmul(x, w, self.indices)
++
+             self.description += "Dense layer {} with input shape {} and output shape {}\n".format(name, x.get_shape(), ret.get_shape())
++            
+             if bias:
+                 b = self.create_bias_variable('b', (1, size, ))
+                 if self.indices is not None:
+@@ -102,7 +402,7 @@
+         return tf.reshape(x, [-1, tf.shape(x)[1], np.prod(x.get_shape()[2:])])
+ 
+     def make_net(self, x, num_actions, indices=None, batch_size=1, ref_batch=None):
+-        with tf.variable_scope('Model') as scope:
++        with tf.variable_scope('ga') as scope:
+             self.description = "Input shape: {}. Number of actions: {}\n".format(x.get_shape(), num_actions)
+             self.scope = scope
+             self.num_actions = num_actions
+--- ./gpu_implementation/neuroevolution/models/dqn.py	
++++ ./gpu_implementation/neuroevolution/models/dqn.py	
+@@ -36,6 +36,66 @@
+         return self.dense(x, num_actions, 'out', std=0.1)
+ 
+ 
++class RiverModel(Model):
++    def _make_net(self, x, num_actions):
++        x = self.nonlin(self.conv(x, name='conv1', num_outputs=16, kernel_size=8, stride=4))
++        x = self.nonlin(self.conv(x, name='conv2', num_outputs=32, kernel_size=4, stride=2))
++        x = self.flattenallbut0(x)
++        x = self.nonlin(self.dense(x, 256, 'fc'))
++
++        return self.dense(x, num_actions, 'out', std=0.1)
++
++
++# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
++
++
++class RecurrentLargeModel(Model):
++    def _make_net(self, x, num_actions):
++        x = self.nonlin(self.conv(x, name='conv1', num_outputs=32, kernel_size=8, stride=4, std=1.0))
++        x = self.nonlin(self.recurrent(x, name='recu1', kernel_size=3, iterations=20,       std=0.1))
++        x = self.nonlin(self.conv(x, name='conv2', num_outputs=64, kernel_size=4, stride=2, std=1.0))
++        x = self.nonlin(self.conv(x, name='conv3', num_outputs=64, kernel_size=3, stride=1, std=1.0))
++        x = self.flattenallbut0(x)
++        x = self.nonlin(self.dense(x, 512, 'fc'))
++
++        return self.dense(x, num_actions, 'out', std=0.1)
++
++class IotasRecurrentLargeModel(Model):
++    def _make_net(self, x, num_actions):
++        x = self.nonlin(self.conv(x, name='conv1', num_outputs=32, kernel_size=8, stride=4,       std=1.0))
++        x = self.nonlin(self.recurrent(x, name='recu1', kernel_size=3, iterations=20, iotas=True, relu=True, std=1.0))
++        x = self.nonlin(self.conv(x, name='conv2', num_outputs=64, kernel_size=4, stride=2,       std=1.0))
++        x = self.nonlin(self.conv(x, name='conv3', num_outputs=64, kernel_size=3, stride=1,       std=1.0))
++        x = self.flattenallbut0(x)
++        x = self.nonlin(self.dense(x, 512, 'fc'))
++
++        return self.dense(x, num_actions, 'out', std=0.1)
++
++class IotasRecurrentLargeModelRELU(Model):
++    def _make_net(self, x, num_actions):
++        x = self.nonlin(self.conv(x, name='conv1', num_outputs=32, kernel_size=8, stride=4,       std=1.0))
++        x = self.nonlin(self.recurrent(x, name='recu1', kernel_size=3, iterations=20, iotas=True, relu=False, std=1.0))
++        x = self.nonlin(self.conv(x, name='conv2', num_outputs=64, kernel_size=4, stride=2,       std=1.0))
++        x = self.nonlin(self.conv(x, name='conv3', num_outputs=64, kernel_size=3, stride=1,       std=1.0))
++        x = self.flattenallbut0(x)
++        x = self.nonlin(self.dense(x, 512, 'fc'))
++
++        return self.dense(x, num_actions, 'out', std=0.1)
++
++class EvoRecurrentLargeModel(Model):
++    def _make_net(self, x, num_actions):
++        x = self.nonlin(self.conv(x, name='conv1', num_outputs=32, kernel_size=8, stride=4, std=1.0))
++        x = self.nonlin(self.recurrentEvo(x, name='evorecu1', kernel_size=3, std=0.1))
++        x = self.nonlin(self.conv(x, name='conv2', num_outputs=64, kernel_size=4, stride=2, std=1.0))
++        x = self.nonlin(self.conv(x, name='conv3', num_outputs=64, kernel_size=3, stride=1, std=1.0))
++        x = self.flattenallbut0(x)
++        x = self.nonlin(self.dense(x, 512, 'fc'))
++
++        return self.dense(x, num_actions, 'out', std=0.1)
++
++# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
++
++
+ class LargeModel(Model):
+     def _make_net(self, x, num_actions):
+         x = self.nonlin(self.conv(x, name='conv1', num_outputs=32, kernel_size=8, stride=4, std=1.0))
+@@ -45,3 +105,16 @@
+         x = self.nonlin(self.dense(x, 512, 'fc'))
+ 
+         return self.dense(x, num_actions, 'out', std=0.1)
++
++
++class RiverModelTest(Model):
++    def _make_net(self, x, num_actions):
++        x = tf.Print(x, [tf.shape(x)], summarize=40000, message= "The x shape is :")
++        x = tf.Print(x, [x], summarize=1200, message="start")
++        x = self.nonlin(self.recurrent(x, name='recu1', kernel_size=3, iterations=10,       std=0.01))
++        x = tf.Print(x, [tf.shape(x)], summarize=40000, message= "The recurrent shape is :")
++        x = tf.Print(x, [x], summarize=1200, message="Recurrent")
++        x = self.flattenallbut0(x)
++        x = self.nonlin(self.dense(x, 256, 'fc'))
++
++        return self.dense(x, num_actions, 'out', std=0.1)
+\ No newline at end of file
+--- ./gpu_implementation/tabular_logger.py	
++++ ./gpu_implementation/tabular_logger.py	
+@@ -139,7 +139,7 @@
+     def log_dir(self):
+         if self.dir:
+             return self.dir
+-        self.dir = tempfile.mkdtemp()
++        self.dir = './'
+         return self.dir
+ 
+     # Logging API, forwarded

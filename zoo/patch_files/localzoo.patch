@@ -1,0 +1,92 @@
++++ ./atari_zoo/activation_movie.py
+@@ -29,7 +29,6 @@
+     #gather activations over entire trajectory
+     obs_idx = 0
+     length = obs.shape[0]
+-
+     collected_reps = []
+ 
+     while obs_idx < length:
+@@ -50,8 +49,12 @@
+ def activations_to_frames(m,activations):
+     obs_idx = 0
+     frames = []
++    # code removes a one dimension from tensor which is used for the batch process in Deep GA - new
++    if len(activations.shape) is 5:
++	    activations = np.reshape(activations, (activations.shape[0],activations.shape[2],activations.shape[3],activations.shape[4]))
++    if len(activations.shape) is 3:
++            activations = np.reshape(activations, (activations.shape[0],activations.shape[2]))
+     length = activations.shape[0]
+-
+     if len(activations.shape)==4:
+         scaling = get_activation_scaling(m,activations)
+ 
+@@ -190,6 +193,7 @@
+ 
+     #now get access to a dictionary that grabs output layers from the model
+     T = import_model(m,X_t,X_t)
++    print(m.layers)
+     activations = [T(layer['name']) for layer in m.layers]
+     
+     clip_dict = make_clips_from_activations(m,frames,obs,activations,session=session,X_t=X_t,fps=60)
++++ ./atari_zoo/config.py
+@@ -12,6 +12,8 @@
+ #     See the License for the specific language governing permissions and
+ #     limitations under the License.
+ 
++from pathlib import Path
++
+ def dopamine_url_formatter(base_url,agent,game,run,tag=None):
+     game_proc = game.split("NoFrameskip")[0]
+     return "gs://download-dopamine-rl/lucid/{agent}/{game}/{run}/graph_def.pb".format(agent=agent,game=game_proc,run=run)
+@@ -30,12 +32,14 @@
+ 
+ 
+ #local lookup table
+-datadir_local_dict = {'apex':"/space/rlzoo/apex",
+-                        'es':"/space/rlzoo/es",
+-                        'ga':"/space/rlzoo/ga",
+-                        'a2c':'/space/rlzoo/a2c',
+-                        'rainbow':'/space/rlzoo/rainbow',
+-                        'dqn':'/space/rlzoo/dqn',
+-                      'impala':'/space/rlzoo/impala' }
++# added new local directory for learning styles
++# these are the locations used in rollout.py and save_model.py
++datadir_local_dict = {'apex':str(Path.home())+"/space/rlzoo/apex",
++                        'es':str(Path.home())+"/space/rlzoo/es",
++                        'ga':str(Path.home())+"/space/rlzoo/ga",
++                        'a2c':str(Path.home())+'/space/rlzoo/a2c',
++                        'rainbow':str(Path.home())+'/space/rlzoo/rainbow',
++                        'dqn':str(Path.home())+'/space/rlzoo/dqn',
++                      'impala':str(Path.home())+'/space/rlzoo/impala' }
+ 
+ debug = True
++++ ./atari_zoo/model_maker.py
+@@ -179,13 +179,22 @@
+ 
+ #Uber's Deep GA
+ class RL_GA(RL_model):
++  # layer names are changed to work with the new frozen model - new 
+   layers = [
+-     {'type': 'conv', 'name': 'ga/conv1/relu', 'size': 32},
+-     {'type': 'conv', 'name': 'ga/conv2/relu', 'size': 64},
+-     {'type': 'conv', 'name': 'ga/conv3/relu', 'size': 64},
+-     {'type': 'dense', 'name': 'ga/fc/relu', 'size': 512},
+-     {'type': 'dense', 'name': 'ga/out/signal', 'size':18}
++     {'type': 'conv', 'name': 'ga/Relu', 'size': 32},
++     {'type': 'conv', 'name': 'ga/Relu_1', 'size': 64},
++     {'type': 'conv', 'name': 'ga/Relu_2', 'size': 64},
++     {'type': 'dense', 'name': 'ga/Relu_3', 'size': 512},
++     {'type': 'dense', 'name': 'ga/Reshape_1', 'size':18}
+    ]
++   # original layer names in atari zoo
++#   layers = [
++#       {'type': 'conv', 'name': 'ga/conv1/relu', 'size': 32},
++#       {'type': 'conv', 'name': 'ga/conv1/relu', 'size': 64},
++#       {'type': 'conv', 'name': 'ga/conv3/relu', 'size': 64},
++#       {'type': 'dense', 'name': 'ga/fc/relu', 'size': 512},
++#       {'type': 'dense', 'name': 'ga/out/signal', 'size':18}
++#   ]
+ 
+   weights = [
+       {'name':'ga/conv1/w'},

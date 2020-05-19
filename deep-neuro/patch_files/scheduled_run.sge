@@ -1,0 +1,225 @@
+#$ -S /bin/bash
+#$ -V
+
+#$ -m n
+#$ -cwd
+
+#1080 Nodes
+##$ -l hostname="ba-fs|face-fs|murdock-fs|hannibal-fs"
+#980s Nodes
+##$ -l hostname="banzhaf-fs|bedau-fs|ray-fs|yaeger-fs|harvey-fs|sims-fs"
+
+##$ -l hostname="ray-fs|yaeger-fs"
+
+##Output file for stdout and stderr
+#$ -j y -o $JOB_NAME.out -e $JOB_NAME.err
+
+##Array job (1 tasks for this job, with SGE_TASK_ID from 1 to 1):
+#$ -t 1:1
+#$ -pe gpu 10 # GPU Job using 10 CPU cores
+
+if [[ $# -eq 0 ]] ; then
+	echo 'No Config File'
+	exit 0
+fi
+
+CUDA_COMPUTE=$2
+
+if [ "$CUDA_COMPUTE" = "980" ]; then
+	BATCH_SIZE=32
+else
+	BATCH_SIZE=64
+fi
+
+#$ -l num_GTX980_per_task=0
+#$ -l num_GTX1080_per_task=2
+#
+#$ -l num_GTXany_per_task=2
+
+dateAndTime=`date +%Y%m%d-%H%M%S`
+launched=`date +%s`
+let minutesApproxHalfMax=4*60 
+
+PROGRAM='ga.py'
+NAME=$1
+PARAMETER="configurations/$NAME.json"
+DIRECTORY='runs'
+files=`echo ga.{out,err} log.txt snapshot.pkl`
+
+#Varivles for Iterations
+let SNAPSHOT_EVERY_TIMESTEP=1000000000
+let RUN_TO_TIMESTEP=1000000000
+
+#Get name of Task
+task_name=$(grep game ${PARAMETER} | tail -1 | grep -Po '(["\\''])(?:(?=(\\?))\2.)*?\1')
+task_name=$(echo $task_name | sed -e  's/^"game"//' -e  's/^ "//' -e  's/"$//')
+
+#Get model of Task
+model_name=$(grep model ${PARAMETER} | tail -1 | grep -Po '(["\\''])(?:(?=(\\?))\2.)*?\1')
+model_name=$(echo $model_name | sed -e  's/^"model"//' -e  's/^ "//' -e  's/"$//')
+
+#Create directory name
+dot='.'
+dir_name="$task_name$dot$model_name"
+
+for RUN in {1..4} ;do
+
+	#eq - is equal to
+	if [ $RUN -eq $SGE_TASK_ID ] ;then
+
+		mkdir -p ${DIRECTORY}/${dir_name}/run-${RUN}/ && cd  ${DIRECTORY}/${dir_name}/run-${RUN}/
+
+		while true ;do
+
+			#Need a stopping function here
+			#True if 'old_snapshots' exists and is a directory.
+			# if [ -d old_snapshots ] ;then exit 0 ;fi # Task complete ... line added in case job or task re-run despite already completing
+
+			echo Task $SGE_TASK_ID running on `hostname` at `date +%H:%M:%S' on '%d%b%Y' : '%s' seconds'` &>>ga.log
+
+			#False if 'continue-from' exists and is a symbolic link.
+			if [ ! -L continue-from ] ;then
+
+				#[ -f FILE ]  True if FILE exists and is a regular file.
+				#mkdir -p == no error if existing, make parent directories as needed
+				#Move any incomplete runs into a new directory 
+
+				#If an error has occured delete files
+				for f in ${files} ;do if [ -f ${f} ] ;then mkdir -p incomplete-runs/failed-before-${dateAndTime}; mv ${f} incomplete-runs/failed-before-${dateAndTime}/ ;fi ;done
+
+				#Varbles to track number of iterations 
+				from=0
+				let to=${from}+${SNAPSHOT_EVERY_TIMESTEP}
+                                if [ ${to} -ge ${RUN_TO_TIMESTEP} ] ;then
+                                        to=${RUN_TO_TIMESTEP}
+                                fi
+
+
+
+				#Save the orginal Parameter file
+				mkdir -p configurations
+				cp ../../../${PARAMETER} ./configurations/
+
+				#Create appropriate file for run 
+				sed -e 's/\(timesteps\)[^\&]\+/timesteps": '"$to"',/' ${PARAMETER} > ${NAME}_${to}.json
+
+				#Activate Program
+				python ../../../${PROGRAM} ./${NAME}_${to}.json ${BATCH_SIZE} >ga.out 2>ga.err
+			else
+				#cat command allows us to view contents of a file the in terminal.
+				from=`cat continue-from/ready-to-be-continued-from`
+				#let - Perform arithmetic on shell variables.
+				let to=${from}+${SNAPSHOT_EVERY_TIMESTEP}
+
+                                if [ ${to} -ge ${RUN_TO_TIMESTEP} ] ;then
+                                        to=${RUN_TO_TIMESTEP}
+                                fi
+
+				#Copy the previous snapshot to current directory 
+				cp continue-from/snapshot.pkl ./
+ 
+				#Create appropriate file for run 
+				sed -e 's/\(timesteps\)[^\&]\+/timesteps": '"$to"',/' configurations/*.json > ${NAME}_${to}.json
+				#Activate Program
+				python ../../../${PROGRAM} ./${NAME}_${to}.json ${BATCH_SIZE} >ga.out 2>ga.err
+			fi
+
+			#let - Perform arithmetic on shell variables.
+			let minutesElapsed=(`date +%s`-${launched})/60
+
+			# If simulation lasts longer than 30 minutes it is assumed it was successful
+			if [ ${minutesElapsed} -ge 30 ] ;then
+				#Log completetion 
+				echo Task $SGE_TASK_ID finished running ga from ${from} to ${to} on `hostname` at `date +%H:%M:%S' on '%d%b%Y' : '%s' seconds'` &>>ga.log
+				# ${compress} ${files}
+				# echo Task $SGE_TASK_ID finished compressing files on `hostname` at `date +%H:%M:%S' on '%d%b%Y' : '%s' seconds'` &>>ga.log
+				# ${compress} ga.log
+
+				saveto=so-far/${from}-${to}
+
+				#True if $saveto exists and is a directory.
+				if [ -d ${saveto} ] ;then mkdir -p incomplete-runs/failed-before-${dateAndTime} ; mv ${saveto} incomplete-runs/failed-before-${dateAndTime}/ ;fi
+
+				#mkdir -p == no error if existing, make parent directories as needed
+				mkdir -p ${saveto}
+
+				#For everyfile in $files and ga.log to $saveto
+				mv `for f in ${files} ${NAME}_${to}.json ;do echo ${f} ;done` ${saveto}/
+				echo ${to} > ${saveto}/ready-to-be-continued-from
+
+				#ln - make links between files
+				#-f   remove existing destination files
+				#-s   make symbolic links instead of hard links
+				#-T   treat LINK_NAME as a normal file always
+				ln -fsT ${saveto} continue-from
+
+				from=${to}
+
+				#Stopping Criteria --------------------------------------------------------------------------
+				# ge - is greater than or equal to
+				if [ ${to} -ge ${RUN_TO_TIMESTEP} ] ;then
+					# Task complete
+					exit 0
+				fi
+
+				# ge - is greater than or equal to
+				if [ ${minutesElapsed} -ge ${minutesApproxHalfMax} ] ;then
+					# Tell Grid Engine to reschedule this task so that it will play nice with the scheduler 
+					# and continue later rather than run forever
+					exit 99 
+				fi
+				#--------------------------------------------------------------------------------------------
+			else
+				echo Task $SGE_TASK_ID failed running ga from ${from} to ${to} on `hostname` at `date +%H:%M:%S' on '%d%b%Y' : '%s' seconds'` &>>ga.log
+				exit 0
+			fi
+		done
+
+		cd ../../../
+	fi
+
+	#Seed is taken from the system clock, sleep provides unqiue times between runs
+	sleep 60
+done
+
+
+
+
+
+
+
+
+# #Get File Path for Snapshot
+# snapshot_filepath=$(grep snapshot 'ga.py.process.out' | tail -1 | grep -Po ' [/]((?:[^/]*/)*)(.*)')
+# echo $snapshot_filepath 
+
+#From - Where generations start
+#To   - How many generations to go to
+
+#If there are 'old_snapshots' directory then stop process
+
+#If there isn't a symbolic link of continue-from from saveto create then
+  #If file from $files exist - create a directory for failed-before - move files to there - run program with seed
+#else
+  #Run program from previous position
+#end if
+
+#Log completetion 
+
+#If previous generation range has a directory:
+   #Move the file to incomplete-runs directory
+
+#Create generation range directory
+
+#Move every file to new generation range directory
+
+#Make a symbolic link between new generation range directory and continue-from (So on the next run it knows where to pick up from)
+
+#If (keep_old_snapshots = false) remove all previous snapshots
+
+#If generations has exceed certain number 
+  #clean up files
+  #remove continue-from directory
+  #exit program
+
+#If out of allocated time submit script back to scheduler 

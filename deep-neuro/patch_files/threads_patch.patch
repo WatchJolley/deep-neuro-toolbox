@@ -1,0 +1,175 @@
+--- ./gpu_implementation/gym_tensorflow/atari/tf_atari.cpp
++++ ./gpu_implementation/gym_tensorflow/atari/tf_atari.cpp
+@@ -142,7 +142,7 @@
+         *ret = env;
+ 
+         const auto thread_pool = context->device()->tensorflow_cpu_worker_threads();
+-        const int num_threads = std::min(thread_pool->num_threads, batch_size);
++        const int num_threads = std::min(program::threads, batch_size);
+         auto f = [&](int thread_id) {
+             for(int b =thread_id; b < batch_size;b+=num_threads)
+             {
+--- ./gpu_implementation/gym_tensorflow/maze/tf_maze.cpp
++++ ./gpu_implementation/gym_tensorflow/maze/tf_maze.cpp
+@@ -117,7 +117,7 @@
+         *ret = env;
+ 
+         const auto thread_pool = context->device()->tensorflow_cpu_worker_threads();
+-        const int num_threads = std::min(thread_pool->num_threads, batch_size);
++        const int num_threads = std::min(program::threads, batch_size);
+         auto f = [&](int thread_id) {
+             for(int b =thread_id; b < batch_size;b+=num_threads)
+             {
+@@ -176,7 +176,7 @@
+             core::ScopedUnref s(tmp_env);
+ 
+             const auto thread_pool = context->device()->tensorflow_cpu_worker_threads();
+-            const int num_threads = std::min(thread_pool->num_threads, int(m_numInterfaces));
++            const int num_threads = std::min(program::threads, int(m_numInterfaces));
+ 
+             auto f = [&](int thread_id) {
+                 // Set all but the first element of the output tensor to 0.
+--- ./gpu_implementation/gym_tensorflow/tf_env.cpp
++++ ./gpu_implementation/gym_tensorflow/tf_env.cpp
+@@ -133,7 +133,7 @@
+         core::ScopedUnref s(env);
+ 
+         const auto thread_pool = context->device()->tensorflow_cpu_worker_threads();
+-        const int num_threads = std::min(thread_pool->num_threads, int(m_numInterfaces));
++        const int num_threads = std::min(program::threads, int(m_numInterfaces));
+         auto f = [&](int thread_id) {
+             // Set all but the first element of the output tensor to 0.
+             for(int b =thread_id; b < m_numInterfaces;b+=num_threads)
+@@ -189,7 +189,7 @@
+         auto image_flat = image_tensor->flat<T>();
+ 
+         const auto thread_pool = context->device()->tensorflow_cpu_worker_threads();
+-        const int num_threads = std::min(thread_pool->num_threads, int(m_numInterfaces));
++        const int num_threads = std::min(program::threads, int(m_numInterfaces));
+ 
+         auto f = [&](int thread_id) {
+             // Set all but the first element of the output tensor to 0.
+@@ -265,7 +265,7 @@
+ 
+         const auto ssize = env->get_action_shape().num_elements();
+         const auto thread_pool = context->device()->tensorflow_cpu_worker_threads();
+-        const int num_threads = std::min(thread_pool->num_threads, int(m_numInterfaces));
++        const int num_threads = std::min(program::threads, int(m_numInterfaces));
+ 
+         auto f = [&](int thread_id) {
+             // Set all but the first element of the output tensor to 0.
+--- ./gpu_implementation/gym_tensorflow/tf_env.h	2020-05-05 22:05:14.279859900 +0100
++++ ./gpu_implementation/gym_tensorflow/tf_env.h	2020-05-05 22:03:47.101057700 +0100
+@@ -23,6 +23,11 @@
+ #include "tensorflow/core/framework/resource_mgr.h"
+ #include "tensorflow/core/framework/op_kernel.h"
+ 
++namespace program 
++{
++   const int threads = 5;
++}
++
+ using namespace tensorflow;
+ class BaseEnvironment : public ResourceBase
+ {
+--- ./gpu_implementation/neuroevolution/concurrent_worker.py	2020-05-05 22:05:14.292859500 +0100
++++ ./gpu_implementation/neuroevolution/concurrent_worker.py	2020-05-05 22:03:47.116138200 +0100
+@@ -25,6 +25,7 @@
+ from queue import Queue
+ from multiprocessing.pool import ApplyResult
+ from .distributed_helpers import AsyncWorker, WorkerHub, AsyncTaskHub
++import tabular_logger as tlogger
+ 
+ class RLEvalutionWorker(AsyncWorker):
+     def __init__(self, make_env_f, model, batch_size, device='/cpu:0', ref_batch=None):
+@@ -130,7 +131,13 @@
+         self.sess = None
+         if not gpus:
+             gpus = ['/cpu:0']
++            tlogger.info('Using CPU')
++        else:
++            tlogger.info('Using GPU')
+         with tf.Session() as sess:
++            # from tensorflow.python import debug as tf_debug
++            # sess = tf_debug.LocalCLIDebugWrapperSession(sess)
++
+             import gym_tensorflow
+             ref_batch = gym_tensorflow.get_ref_batch(make_env_f, sess, 128)
+             ref_batch=ref_batch[:, ...]
+@@ -162,6 +169,10 @@
+         tstart = time.time()
+ 
+         tasks = []
++
++        """
++        Add all tasks to async. Logs progress every 5 seconds.
++        """
+         for t in it:
+             tasks.append(self.eval_async(*t, max_frames=max_frames))
+             if time.time() - tstart > logging_interval:
+@@ -170,6 +181,9 @@
+                 tstart = time.time()
+                 last_timesteps = cur_timesteps
+ 
++        """
++        Checks if all the tasks have complete.  Logs progress every 5 seconds.
++        """
+         while not all([t.ready() for t in tasks]):
+             if time.time() - tstart > logging_interval:
+                 cur_timesteps = self.sess.run(self.steps_counter)
+--- ./gpu_implementation/neuroevolution/tf_util.py	2020-05-05 22:05:14.328860900 +0100
++++ ./gpu_implementation/neuroevolution/tf_util.py	2020-05-05 22:03:47.173053900 +0100
+@@ -19,11 +19,38 @@
+ 
+ import tensorflow as tf
+ import numpy as np
++import GPUtil
+ 
+ import tabular_logger as tlogger
+ 
+-def get_available_gpus():
++def get_available_gpus(numGPUs=2):
++    import os
+     from tensorflow.python.client import device_lib
++    os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID" 
++    AvailabeGPUs = []
++    GPUs = []
++
++    #Boolean Idicator of GPUs Availability
++    deviceID = GPUtil.getAvailability(GPUtil.getGPUs(), maxLoad = 0.5, maxMemory = 0.001)
++    print (deviceID)
++
++    # Puts each Availabe GPU ID into a list
++    for device in range(0, len(deviceID)):
++        if deviceID[device] == 1:   
++            AvailabeGPUs.append(device)
++    print(AvailabeGPUs)
++
++    # Puts the apprioate amount of GPUs IDs into a list
++    for x in range(0, numGPUs):
++        GPUs.append(AvailabeGPUs[x])
++    print (str(GPUs))
++
++    #Format list for CUDA_VISIBLE_DEVICES
++    GPUstring = " ".join(str(x) for x in GPUs)
++    GPUstring = GPUstring.replace(" ", ",")
++    print (GPUstring)
++
++    os.environ["CUDA_VISIBLE_DEVICES"]= str(GPUstring)
+     local_device_protos = device_lib.list_local_devices()
+     return [x.name for x in local_device_protos if x.device_type == 'GPU']
+ 
+@@ -33,6 +60,13 @@
+         self._worker = worker
+     def __enter__(self, *args, **kwargs):
+         self._sess = tf.Session(*args, **kwargs)
++
++        #config = tf.ConfigProto()
++        #config.intra_op_parallelism_threads = 1
++        #config.inter_op_parallelism_threads = 1
++        #config.allow_soft_placement=True
++
++        #self._sess = tf.Session(config=config)
+         self._sess.run(tf.global_variables_initializer())
+         self._worker.initialize(self._sess)
+ 
